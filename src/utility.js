@@ -45,4 +45,14 @@ function when(iso) {
   return new Date(iso).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
 }
 
-module.exports = { TYPES, slug, ticketName, shortText, when };
+// Quando cargos gerais são definidos, somente eles têm acesso via cargo.
+// Sem cargos gerais, preserva o funcionamento antigo por departamento.
+function ticketRoleIds(settings, type) {
+  const globals = ['role_staff', 'role_admin', 'role_owner']
+    .map(key => settings?.[key]).filter(Boolean);
+  if (globals.length) return [...new Set(globals)];
+  const fallback = settings?.[TYPES[type]?.roleKey];
+  return fallback ? [fallback] : [];
+}
+
+module.exports = { TYPES, slug, ticketName, shortText, when, ticketRoleIds };

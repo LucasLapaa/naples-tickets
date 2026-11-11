@@ -41,10 +41,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_tickets_channel ON tickets (channel_id);
 `);
 
+// Atualização segura: mantém as configurações e tickets já existentes.
+const existingSettingsColumns = new Set(db.pragma('table_info(guild_settings)').map(c => c.name));
+for (const column of ['role_staff', 'role_admin', 'role_owner']) {
+  if (!existingSettingsColumns.has(column)) {
+    db.exec(`ALTER TABLE guild_settings ADD COLUMN ${column} TEXT`);
+  }
+}
+
 const selectSetting = db.prepare('SELECT * FROM guild_settings WHERE guild_id = ?');
 const insertSetting = db.prepare('INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)');
 const settingsColumns = new Set([
   'configured', 'role_suporte', 'role_vendas', 'role_duvidas',
+  'role_staff', 'role_admin', 'role_owner',
   'category_suporte', 'category_vendas', 'category_duvidas', 'log_channel'
 ]);
 
@@ -79,6 +88,10 @@ function getTicketByChannel(id) { return db.prepare('SELECT * FROM tickets WHERE
 function getOpenTicket(guildId, ownerId) {
   return db.prepare(`SELECT * FROM tickets WHERE guild_id = ? AND owner_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1`).get(guildId, ownerId);
 }
+function listExistingTickets(guildId) {
+  return db.prepare(`SELECT * FROM tickets WHERE guild_id = ? AND status IN ('open', 'closed') ORDER BY id`)
+    .all(guildId);
+}
 function setControls(id, messageId) {
   db.prepare('UPDATE tickets SET controls_message_id = ? WHERE id = ?').run(messageId, id);
 }
@@ -110,5 +123,5 @@ function rate(id, userId, stars) {
 module.exports = {
   db, getSettings, saveSettings, nextNumber, addTicket, getTicketById,
   getTicketByChannel, getOpenTicket, setControls, claim, release, close,
-  reopen, markDeleted, rate
+  reopen, markDeleted, rate, listExistingTickets
 };
