@@ -13,7 +13,7 @@ const { transcriptAttachment } = require('./src/transcript');
 const { TYPES, ticketName, shortText, ticketRoleIds } = require('./src/utility');
 
 const { BOT_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
-console.log('[Naples] BUILD v1.0.3 - correção /configurar carregada');
+console.log('[Naples] BUILD v1.0.4 - comando /imagem habilitado');
 if (!BOT_TOKEN || !CLIENT_ID || !GUILD_ID ||
     BOT_TOKEN.startsWith('COLE_') || !/^\d{17,20}$/.test(CLIENT_ID) || !/^\d{17,20}$/.test(GUILD_ID)) {
   console.error('Configure BOT_TOKEN, CLIENT_ID e GUILD_ID no .env ou nas Variables do Railway.');
@@ -47,6 +47,17 @@ function createCommands() {
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addChannelOption(o => o.setName('canal').setDescription('Canal onde publicar o painel').addChannelTypes(ChannelType.GuildText));
 
+  // Publica qualquer imagem enviada pelo administrador em um canal de texto.
+  const imagePost = new SlashCommandBuilder()
+    .setName('imagem').setDescription('Publica uma imagem em um canal escolhido (administradores)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o => o.setName('canal').setDescription('Canal que receberá a imagem')
+      .addChannelTypes(ChannelType.GuildText).setRequired(true))
+    .addAttachmentOption(o => o.setName('arquivo').setDescription('Imagem PNG, JPG, WEBP ou GIF')
+      .setRequired(true))
+    .addStringOption(o => o.setName('legenda').setDescription('Texto opcional acima da imagem')
+      .setMaxLength(1000));
+
   const ticket = new SlashCommandBuilder()
     .setName('ticket').setDescription('Ferramentas para o atendimento atual')
     .addSubcommand(s => s.setName('info').setDescription('Mostra os dados do ticket'))
@@ -65,7 +76,7 @@ function createCommands() {
     .setDescription('Aplica os cargos atuais nos tickets já criados (remove acessos adicionais)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
 
-  return [configure, panel, ticket, privacy].map(c => c.toJSON());
+  return [configure, panel, imagePost, ticket, privacy].map(c => c.toJSON());
 }
 
 async function registerCommands() {
@@ -284,6 +295,47 @@ async function onPanel(interaction) {
   await interaction.deferReply({ flags: EPHEMERAL });
   const posted = await dest.send({ ...design.panel(), allowedMentions: { parse: [] } });
   return interaction.editReply(`✅ Painel publicado em <#${dest.id}>: ${posted.url}`);
+}
+
+async function onImagePost(interaction) {
+  if (!isAdmin(interaction)) return replyError(interaction, 'Somente administradores podem publicar imagens.');
+  const guild = await resolveGuild(interaction);
+  if (!guild) return replyError(interaction, GUILD_MISSING_MESSAGE);
+
+  const selected = interaction.options.getChannel('canal', true);
+  const image = interaction.options.getAttachment('arquivo', true);
+  const caption = interaction.options.getString('legenda') || '';
+  const destination = await guild.channels.fetch(selected.id).catch(() => null);
+  if (!destination || destination.type !== ChannelType.GuildText)
+    return replyError(interaction, 'Escolha um canal de texto do servidor Naples Community.');
+
+  // Aceita imagens enviadas diretamente no Discord, evitando URL fornecida por terceiros.
+  const extension = image.name?.split('.').pop()?.toLowerCase() || '';
+  const allowed = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
+  const isImage = (image.contentType && image.contentType.startsWith('image/')) ||
+    (!image.contentType && allowed.includes(extension));
+  if (!isImage || !allowed.includes(extension))
+    return replyError(interaction, 'Envie um arquivo PNG, JPG, JPEG, WEBP ou GIF.');
+
+  const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+  const permissions = me && destination.permissionsFor(me);
+  if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.AttachFiles])) {
+    return replyError(interaction, 'O bot precisa de Ver Canal, Enviar Mensagens e Anexar Arquivos nesse canal.');
+  }
+
+  await interaction.deferReply({ flags: EPHEMERAL });
+  try {
+    const sent = await destination.send({
+      content: caption || undefined,
+      files: [{ attachment: image.url, name: `naples-imagem.${extension}` }],
+      allowedMentions: { parse: [] }
+    });
+    return interaction.editReply(`✅ Imagem publicada em <#${destination.id}>! ${sent.url}`);
+  } catch (err) {
+    safeError(err, 'Publicar imagem');
+    return interaction.editReply('❌ Não consegui publicar a imagem. Confira as permissões do canal e o tamanho do arquivo.');
+  }
 }
 
 async function onOpenButton(interaction, type) {
@@ -567,6 +619,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'configurar') return await onConfigure(interaction);
       if (interaction.commandName === 'painel') return await onPanel(interaction);
+      if (interaction.commandName === 'imagem') return await onImagePost(interaction);
       if (interaction.commandName === 'ticket') return await onTicketCommand(interaction);
       if (interaction.commandName === 'privacidade') return await onPrivacy(interaction);
     }
