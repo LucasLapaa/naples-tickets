@@ -11,9 +11,10 @@ const store = require('./src/database');
 const design = require('./src/design');
 const { transcriptAttachment } = require('./src/transcript');
 const { TYPES, ticketName, shortText, ticketRoleIds } = require('./src/utility');
+const { newPixService, buildCommand: buildPixCommand } = require('./src/pix');
 
 const { BOT_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
-console.log('[Naples] BUILD v1.0.5 - /imagem com anexo, link e URL de imagem');
+console.log('[Naples] BUILD v1.0.6 - /pix Mercado Pago + /imagem + tickets');
 if (!BOT_TOKEN || !CLIENT_ID || !GUILD_ID ||
     BOT_TOKEN.startsWith('COLE_') || !/^\d{17,20}$/.test(CLIENT_ID) || !/^\d{17,20}$/.test(GUILD_ID)) {
   console.error('Configure BOT_TOKEN, CLIENT_ID e GUILD_ID no .env ou nas Variables do Railway.');
@@ -80,7 +81,7 @@ function createCommands() {
     .setDescription('Aplica os cargos atuais nos tickets já criados (remove acessos adicionais)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
 
-  return [configure, panel, imagePost, ticket, privacy].map(c => c.toJSON());
+  return [configure, panel, imagePost, ticket, privacy, buildPixCommand()].map(c => c.toJSON());
 }
 
 async function registerCommands() {
@@ -653,6 +654,13 @@ async function onTicketCommand(interaction) {
   }
 }
 
+// Integração separada para não modificar funções dos tickets/imagens.
+const pixService = newPixService({
+  client, store, serverId: GUILD_ID, getTicket: guildTicket,
+  isStaff, isAdmin, sendLog
+});
+const pixHttpServer = pixService.startHttpServer();
+
 client.on(Events.InteractionCreate, async interaction => {
   try {
     // Avaliações acontecem por DM; por isso são processadas antes da checagem de servidor.
@@ -665,8 +673,15 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.commandName === 'configurar') return await onConfigure(interaction);
       if (interaction.commandName === 'painel') return await onPanel(interaction);
       if (interaction.commandName === 'imagem') return await onImagePost(interaction);
+      if (interaction.commandName === 'pix') return await pixService.showPixModal(interaction);
       if (interaction.commandName === 'ticket') return await onTicketCommand(interaction);
       if (interaction.commandName === 'privacidade') return await onPrivacy(interaction);
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('naples:pix:')) {
+      return await pixService.submitPixModal(interaction);
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('naples:pixcheck:')) {
+      return await pixService.checkPixButton(interaction);
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith('naples:form:')) {
       return await onFormSubmit(interaction, interaction.customId.split(':')[2]);
@@ -688,6 +703,7 @@ client.on(Events.InteractionCreate, async interaction => {
 });
 
 client.once(Events.ClientReady, ready => {
+  pixService.recoverPixNotifications().catch(e => console.error('[Naples/Pix] Recuperar:', e.message));
   console.log(`[Naples] Online como ${ready.user.tag} | Servidor: ${GUILD_ID}`);
   console.log('[Naples] SQLite:', process.env.DATABASE_PATH || process.env.RAILWAY_VOLUME_MOUNT_PATH || './data/naples.sqlite');
   if (ready.guilds.cache.has(GUILD_ID)) {
@@ -702,7 +718,7 @@ async function boot() {
   await registerCommands();
   await client.login(BOT_TOKEN);
 }
-boot().catch(err => { safeError(err, 'Inicialização'); process.exitCode = 1; });
+boot().catch(err => { safeError(err, 'Inicialização'); pixHttpServer.close(); client.destroy(); store.db.close(); process.exitCode = 1; });
 
-process.on('SIGINT', () => { client.destroy(); store.db.close(); process.exit(0); });
-process.on('SIGTERM', () => { client.destroy(); store.db.close(); process.exit(0); });
+process.on('SIGINT', () => { pixHttpServer.close(); client.destroy(); store.db.close(); process.exit(0); });
+process.on('SIGTERM', () => { pixHttpServer.close(); client.destroy(); store.db.close(); process.exit(0); });
