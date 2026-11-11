@@ -1,0 +1,502 @@
+'use strict';
+
+require('dotenv').config();
+const {
+  Client, Events, GatewayIntentBits, REST, Routes,
+  SlashCommandBuilder, ChannelType, PermissionFlagsBits,
+  MessageFlags, ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  EmbedBuilder
+} = require('discord.js');
+const store = require('./src/database');
+const design = require('./src/design');
+const { transcriptAttachment } = require('./src/transcript');
+const { TYPES, ticketName, shortText } = require('./src/utility');
+
+const { BOT_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
+if (!BOT_TOKEN || !CLIENT_ID || !GUILD_ID ||
+    BOT_TOKEN.startsWith('COLE_') || !/^\d{17,20}$/.test(CLIENT_ID) || !/^\d{17,20}$/.test(GUILD_ID)) {
+  console.error('Configure BOT_TOKEN, CLIENT_ID e GUILD_ID no .env ou nas Variables do Railway.');
+  process.exit(1);
+}
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+});
+const opening = new Set();
+const lastOpened = new Map();
+const EPHEMERAL = MessageFlags.Ephemeral;
+
+function createCommands() {
+  const configure = new SlashCommandBuilder()
+    .setName('configurar').setDescription('Configura os setores do Naples Tickets (administradores)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addRoleOption(o => o.setName('cargo_suporte').setDescription('Atendentes de suporte'))
+    .addRoleOption(o => o.setName('cargo_vendas').setDescription('Atendentes de vendas'))
+    .addRoleOption(o => o.setName('cargo_duvidas').setDescription('Atendentes de dúvidas'))
+    .addChannelOption(o => o.setName('canal_logs').setDescription('Canal privado para auditoria').addChannelTypes(ChannelType.GuildText))
+    .addChannelOption(o => o.setName('categoria_suporte').setDescription('Categoria de tickets de suporte').addChannelTypes(ChannelType.GuildCategory))
+    .addChannelOption(o => o.setName('categoria_vendas').setDescription('Categoria de tickets de vendas').addChannelTypes(ChannelType.GuildCategory))
+    .addChannelOption(o => o.setName('categoria_duvidas').setDescription('Categoria de tickets de dúvidas').addChannelTypes(ChannelType.GuildCategory));
+
+  const panel = new SlashCommandBuilder()
+    .setName('painel').setDescription('Publica o painel de abertura de tickets')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addChannelOption(o => o.setName('canal').setDescription('Canal onde publicar o painel').addChannelTypes(ChannelType.GuildText));
+
+  const ticket = new SlashCommandBuilder()
+    .setName('ticket').setDescription('Ferramentas para o atendimento atual')
+    .addSubcommand(s => s.setName('info').setDescription('Mostra os dados do ticket'))
+    .addSubcommand(s => s.setName('transcript').setDescription('Exporta a conversa para TXT'))
+    .addSubcommand(s => s.setName('fechar').setDescription('Encerra o atendimento atual'))
+    .addSubcommand(s => s.setName('reabrir').setDescription('Reabre um atendimento fechado (equipe)'))
+    .addSubcommand(s => s.setName('adicionar').setDescription('Adiciona alguém ao canal (equipe)')
+      .addUserOption(o => o.setName('usuario').setDescription('Membro a adicionar').setRequired(true)))
+    .addSubcommand(s => s.setName('remover').setDescription('Remove um convidado do canal (equipe)')
+      .addUserOption(o => o.setName('usuario').setDescription('Membro a remover').setRequired(true)))
+    .addSubcommand(s => s.setName('renomear').setDescription('Renomeia o canal (equipe)')
+      .addStringOption(o => o.setName('nome').setDescription('Assunto curto para o nome do canal').setRequired(true).setMinLength(2).setMaxLength(35)));
+
+  return [configure, panel, ticket].map(c => c.toJSON());
+}
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: createCommands() });
+  console.log('[Naples] Comandos registrados neste servidor.');
+}
+
+function isAdmin(interaction) {
+  return !!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+}
+function isStaff(interaction, t) {
+  if (isAdmin(interaction)) return true;
+  const conf = store.getSettings(interaction.guildId);
+  const roleId = conf[TYPES[t.type].roleKey];
+  if (!roleId) return false;
+  const memberRoles = interaction.member?.roles;
+  return !!(memberRoles?.cache?.has(roleId) || (Array.isArray(memberRoles) && memberRoles.includes(roleId)));
+}
+function canView(interaction, t) {
+  return t.owner_id === interaction.user.id || isStaff(interaction, t);
+}
+function guildTicket(interaction) {
+  if (!interaction.guild || !interaction.channelId) return null;
+  const t = store.getTicketByChannel(interaction.channelId);
+  return t && t.guild_id === interaction.guildId && t.status !== 'deleted' ? t : null;
+}
+function safeError(err, context) {
+  console.error(`[Naples] ${context}:`, err);
+}
+async function replyError(interaction, message) {
+  const data = { content: `⚠️ ${message}`, flags: EPHEMERAL };
+  if (interaction.deferred || interaction.replied) {
+    return interaction.followUp(data).catch(err => safeError(err, 'Resposta de erro'));
+  }
+  return interaction.reply(data).catch(err => safeError(err, 'Resposta de erro'));
+}
+
+async function makeCategoriesAndLogs(guild, config) {
+  const updates = {};
+  const categories = {
+    suporte: 'NAPLES • SUPORTE',
+    vendas: 'NAPLES • VENDAS',
+    duvidas: 'NAPLES • DÚVIDAS'
+  };
+  for (const [type, name] of Object.entries(categories)) {
+    const column = TYPES[type].categoryKey;
+    const previous = config[column];
+    const found = previous ? await guild.channels.fetch(previous).catch(() => null) : null;
+    if (found?.type === ChannelType.GuildCategory) continue;
+    const created = await guild.channels.create({ name, type: ChannelType.GuildCategory, reason: 'Configuração inicial Naples Tickets' });
+    updates[column] = created.id;
+  }
+  const existingLog = config.log_channel ? await guild.channels.fetch(config.log_channel).catch(() => null) : null;
+  if (!existingLog || existingLog.type !== ChannelType.GuildText) {
+    const created = await guild.channels.create({
+      name: 'naples-logs', type: ChannelType.GuildText,
+      permissionOverwrites: [
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: client.user.id, allow: [
+          PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.AttachFiles
+        ] }
+      ],
+      reason: 'Logs privados do Naples Tickets'
+    });
+    updates.log_channel = created.id;
+  }
+  return updates;
+}
+
+async function onConfigure(interaction) {
+  if (!isAdmin(interaction)) return replyError(interaction, 'Apenas administradores podem configurar o bot.');
+  await interaction.deferReply({ flags: EPHEMERAL });
+  const existing = store.getSettings(interaction.guildId);
+  const updates = {};
+  for (const type of Object.keys(TYPES)) {
+    const role = interaction.options.getRole(`cargo_${type}`);
+    const category = interaction.options.getChannel(`categoria_${type}`);
+    if (role) {
+      if (role.id === interaction.guildId || role.managed) {
+        return interaction.editReply('Escolha um cargo comum de atendimento, não @everyone nem cargos gerenciados por integrações.');
+      }
+      updates[TYPES[type].roleKey] = role.id;
+    }
+    if (category) updates[TYPES[type].categoryKey] = category.id;
+  }
+  const log = interaction.options.getChannel('canal_logs');
+  if (log) updates.log_channel = log.id;
+  // Usa primeiro as escolhas recém-enviadas; cria apenas o que ainda estiver ausente.
+  const auto = await makeCategoriesAndLogs(interaction.guild, { ...existing, ...updates });
+  Object.assign(updates, auto, { configured: 1 });
+  const saved = store.saveSettings(interaction.guildId, updates);
+  const body = Object.entries(TYPES).map(([type, def]) =>
+    `${def.emoji} **${def.label}**: <#${saved[def.categoryKey]}> | Equipe: ${saved[def.roleKey] ? `<@&${saved[def.roleKey]}>` : '**não definida**'}`
+  ).join('\n');
+  return interaction.editReply({
+    content: `✅ **Naples Tickets configurado!**\n\n${body}\n📑 Logs: <#${saved.log_channel}>\n\n` +
+      '**Próximo passo:** defina os cargos de equipe, se faltarem, e use `/painel` para publicar o menu. ' +
+      'Mudanças de cargos se aplicam automaticamente aos novos tickets; ajuste permissões dos antigos manualmente se necessário.',
+    allowedMentions: { parse: [] }
+  });
+}
+
+async function onPanel(interaction) {
+  if (!isAdmin(interaction)) return replyError(interaction, 'Somente administradores podem publicar o painel.');
+  const config = store.getSettings(interaction.guildId);
+  if (!config.configured) return replyError(interaction, 'Execute `/configurar` antes de publicar o painel.');
+  const dest = interaction.options.getChannel('canal') || interaction.channel;
+  if (!dest || dest.type !== ChannelType.GuildText) return replyError(interaction, 'Escolha um canal de texto.');
+  await interaction.deferReply({ flags: EPHEMERAL });
+  const posted = await dest.send({ ...design.panel(), allowedMentions: { parse: [] } });
+  return interaction.editReply(`✅ Painel publicado em <#${dest.id}>: ${posted.url}`);
+}
+
+async function onOpenButton(interaction, type) {
+  if (!TYPES[type]) return replyError(interaction, 'Departamento inválido.');
+  const settings = store.getSettings(interaction.guildId);
+  if (!settings.configured) return replyError(interaction, 'Os setores ainda não foram configurados.');
+  const existing = store.getOpenTicket(interaction.guildId, interaction.user.id);
+  if (existing) {
+    const channel = await interaction.guild.channels.fetch(existing.channel_id).catch(() => null);
+    if (channel) return replyError(interaction, `Você já tem um ticket aberto em <#${channel.id}>.`);
+    store.markDeleted(existing.id); // limpeza caso alguém tenha excluído o canal manualmente
+  }
+  await interaction.showModal(design.form(type));
+}
+
+async function onFormSubmit(interaction, type) {
+  if (!TYPES[type]) return replyError(interaction, 'Categoria inválida.');
+  const key = `${interaction.guildId}:${interaction.user.id}`;
+  if (opening.has(key)) return replyError(interaction, 'Já estamos criando seu ticket.');
+  if (Date.now() - (lastOpened.get(key) || 0) < 30_000) return replyError(interaction, 'Aguarde 30 segundos antes de abrir outro ticket.');
+  opening.add(key);
+  let createdChannel;
+  let savedTicket;
+  try {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const guild = interaction.guild;
+    const settings = store.getSettings(guild.id);
+    if (!settings.configured) return interaction.editReply('O bot ainda não foi configurado.');
+    const old = store.getOpenTicket(guild.id, interaction.user.id);
+    if (old) {
+      const channel = await guild.channels.fetch(old.channel_id).catch(() => null);
+      if (channel) return interaction.editReply(`Você já tem um atendimento aberto em <#${channel.id}>.`);
+      store.markDeleted(old.id);
+    }
+    const definition = TYPES[type];
+    const number = store.nextNumber(guild.id);
+    const topic = interaction.fields.getTextInputValue('topic');
+    const details = interaction.fields.getTextInputValue('details');
+    const roleId = settings[definition.roleKey];
+    const categoryId = settings[definition.categoryKey];
+    const overwrites = [
+      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: client.user.id, allow: [
+        PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles
+      ] },
+      { id: interaction.user.id, allow: [
+        PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles
+      ] }
+    ];
+    if (roleId && guild.roles.cache.has(roleId)) {
+      overwrites.push({ id: roleId, allow: [
+        PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles
+      ] });
+    }
+    createdChannel = await guild.channels.create({
+      name: ticketName(number, type),
+      type: ChannelType.GuildText,
+      parent: categoryId || undefined,
+      permissionOverwrites: overwrites,
+      reason: `Naples Tickets | ${type} | ${interaction.user.id}`
+    });
+    savedTicket = store.addTicket({
+      guild_id: guild.id, number, channel_id: createdChannel.id,
+      owner_id: interaction.user.id, type, topic, details
+    });
+    const hasRole = roleId && guild.roles.cache.has(roleId);
+    const mention = `<@${interaction.user.id}>${hasRole ? ` • <@&${roleId}>` : ''}`;
+    const message = await createdChannel.send({
+      content: mention,
+      embeds: [design.ticketCard(savedTicket)],
+      components: design.ticketButtons('open'),
+      allowedMentions: { users: [interaction.user.id], roles: hasRole ? [roleId] : [] }
+    });
+    store.setControls(savedTicket.id, message.id);
+    lastOpened.set(key, Date.now());
+    await interaction.editReply(`✅ Ticket **#${String(number).padStart(4, '0')}** criado! Acesse <#${createdChannel.id}>.`);
+    await sendLog(guild, `🟢 Ticket #${number} aberto (${definition.label}) por <@${interaction.user.id}>.`, null);
+  } catch (err) {
+    safeError(err, 'Criar ticket');
+    if (savedTicket) store.markDeleted(savedTicket.id);
+    if (createdChannel) await createdChannel.delete('Falha na abertura de ticket').catch(() => {});
+    await interaction.editReply('❌ Não foi possível criar o ticket. Confira as permissões do bot (Gerenciar canais e Gerenciar cargos) e tente novamente.').catch(() => {});
+  } finally {
+    opening.delete(key);
+  }
+}
+
+async function sendLog(guild, text, attachment) {
+  const config = store.getSettings(guild.id);
+  if (!config.log_channel) return;
+  try {
+    const log = await guild.channels.fetch(config.log_channel);
+    if (!log?.isTextBased()) return;
+    await log.send({
+      embeds: [new EmbedBuilder().setColor(design.GREEN).setDescription(shortText(text, 3800)).setTimestamp()],
+      files: attachment ? [attachment] : [],
+      allowedMentions: { parse: [] }
+    });
+  } catch (err) { safeError(err, 'Enviar log'); }
+}
+
+async function refreshControls(channel, ticket) {
+  const payload = {
+    embeds: [design.ticketCard(ticket)],
+    components: design.ticketButtons(ticket.status, !!ticket.claimed_by),
+    allowedMentions: { parse: [] }
+  };
+  try {
+    if (ticket.controls_message_id) {
+      const old = await channel.messages.fetch(ticket.controls_message_id);
+      await old.edit(payload);
+      return;
+    }
+  } catch (_) { /* Mensagem apagada manualmente: publicar outra. */ }
+  const newer = await channel.send(payload);
+  store.setControls(ticket.id, newer.id);
+}
+
+async function onClaim(interaction, action) {
+  const t = guildTicket(interaction);
+  if (!t) return replyError(interaction, 'Este canal não é um ticket ativo do Naples Tickets.');
+  if (t.status !== 'open') return replyError(interaction, 'Este atendimento está fechado.');
+  if (!isStaff(interaction, t)) return replyError(interaction, 'Apenas a equipe responsável pode assumir tickets.');
+  await interaction.deferReply({ flags: EPHEMERAL });
+  if (action === 'claim') {
+    if (!store.claim(t.id, interaction.user.id)) return interaction.editReply('Este ticket já foi assumido por outro atendente.');
+    await interaction.channel.send({ content: `🤝 <@${interaction.user.id}> assumiu o atendimento.`, allowedMentions: { users: [interaction.user.id] } });
+  } else {
+    if (!store.release(t.id, interaction.user.id, isAdmin(interaction))) {
+      return interaction.editReply('Apenas quem assumiu o ticket ou um administrador pode liberá-lo.');
+    }
+    await interaction.channel.send({ content: '🟡 Atendimento liberado para a equipe.' });
+  }
+  await refreshControls(interaction.channel, store.getTicketById(t.id));
+  await interaction.editReply('✅ Responsável atualizado.');
+}
+
+async function sendRating(t, guild) {
+  try {
+    const owner = await client.users.fetch(t.owner_id);
+    await owner.send({
+      embeds: [new EmbedBuilder().setColor(design.GREEN)
+        .setTitle('⭐ Como foi o atendimento?')
+        .setDescription(`Seu ticket **#${String(t.number).padStart(4, '0')}** na **${guild.name}** foi encerrado.\nAvalie o atendimento de 1 a 5 estrelas.`)
+        .setFooter({ text: 'Naples Tickets • Sua avaliação será registrada' })],
+      components: design.ratingButtons(t.id)
+    });
+  } catch (_) {
+    // DM pode estar bloqueada; não impede o encerramento.
+  }
+}
+
+async function onClose(interaction) {
+  const t = guildTicket(interaction);
+  if (!t) return replyError(interaction, 'Use esta opção em um canal de ticket.');
+  if (!canView(interaction, t)) return replyError(interaction, 'Você não pode encerrar este atendimento.');
+  if (t.status !== 'open') return replyError(interaction, 'O ticket já está fechado.');
+  await interaction.deferReply({ flags: EPHEMERAL });
+  // Alterar permissão antes de registrar o fechamento evita canal aberto com status fechado.
+  await interaction.channel.permissionOverwrites.edit(t.owner_id, { SendMessages: false }, { reason: 'Ticket encerrado' });
+  if (!store.close(t.id)) return interaction.editReply('O ticket já foi encerrado.');
+  const closed = store.getTicketById(t.id);
+  await interaction.channel.setName(ticketName(t.number, t.type, 'fechado')).catch(() => {});
+  await refreshControls(interaction.channel, closed);
+  await interaction.channel.send({ content: `🔒 Ticket encerrado por <@${interaction.user.id}>. Para reabrir, contate a equipe.`, allowedMentions: { users: [interaction.user.id] } });
+  let attachment = null;
+  try { attachment = await transcriptAttachment(interaction.channel, closed); }
+  catch (err) { safeError(err, 'Transcrição no encerramento'); }
+  await sendLog(interaction.guild, `🔒 Ticket #${t.number} (${TYPES[t.type].label}) encerrado por <@${interaction.user.id}>. Proprietário: <@${t.owner_id}>.`, attachment);
+  await sendRating(closed, interaction.guild);
+  await interaction.editReply('✅ Ticket encerrado. O histórico foi encaminhado aos logs (quando configurados).');
+}
+
+async function onReopen(interaction) {
+  const t = guildTicket(interaction);
+  if (!t) return replyError(interaction, 'Use esta opção em um ticket.');
+  if (!isStaff(interaction, t)) return replyError(interaction, 'Apenas a equipe pode reabrir tickets.');
+  if (t.status !== 'closed') return replyError(interaction, 'Este ticket não está fechado.');
+  await interaction.deferReply({ flags: EPHEMERAL });
+  const another = store.getOpenTicket(t.guild_id, t.owner_id);
+  if (another && another.id !== t.id) return interaction.editReply(`O solicitante já tem outro ticket aberto: <#${another.channel_id}>.`);
+  await interaction.channel.permissionOverwrites.edit(t.owner_id, { SendMessages: true }, { reason: 'Ticket reaberto' });
+  if (!store.reopen(t.id)) return interaction.editReply('O ticket já foi reaberto.');
+  const reopened = store.getTicketById(t.id);
+  await interaction.channel.setName(ticketName(t.number, t.type)).catch(() => {});
+  await refreshControls(interaction.channel, reopened);
+  await interaction.channel.send({ content: `🔓 Atendimento reaberto por <@${interaction.user.id}>.`, allowedMentions: { users: [interaction.user.id] } });
+  await sendLog(interaction.guild, `🔓 Ticket #${t.number} reaberto por <@${interaction.user.id}>.`);
+  await interaction.editReply('✅ Ticket reaberto.');
+}
+
+async function onTranscript(interaction) {
+  const t = guildTicket(interaction);
+  if (!t) return replyError(interaction, 'Use esta opção em um ticket.');
+  if (!canView(interaction, t)) return replyError(interaction, 'Você não tem acesso ao histórico deste ticket.');
+  await interaction.deferReply({ flags: EPHEMERAL });
+  const file = await transcriptAttachment(interaction.channel, t);
+  return interaction.editReply({ content: '📄 Aqui está a transcrição do ticket:', files: [file] });
+}
+
+async function onDelete(interaction, confirm = false, expectedId = null) {
+  const t = guildTicket(interaction);
+  if (!t) return replyError(interaction, 'Ticket não encontrado.');
+  if (expectedId !== null && Number(expectedId) !== t.id) return replyError(interaction, 'Confirmação de ticket diferente.');
+  if (!isStaff(interaction, t)) return replyError(interaction, 'Apenas a equipe pode excluir tickets.');
+  if (t.status !== 'closed') return replyError(interaction, 'Feche o ticket antes de excluí-lo.');
+  if (!confirm) {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`naples:confirm-delete:${t.id}`).setStyle(ButtonStyle.Danger).setLabel('Confirmar exclusão'),
+      new ButtonBuilder().setCustomId('naples:cancel-delete').setStyle(ButtonStyle.Secondary).setLabel('Cancelar')
+    );
+    return interaction.reply({ content: '⚠️ **Atenção:** o canal será excluído definitivamente. Confirma?', components: [row], flags: EPHEMERAL });
+  }
+  await interaction.deferReply({ flags: EPHEMERAL });
+  let attachment = null;
+  try { attachment = await transcriptAttachment(interaction.channel, t); }
+  catch (err) { safeError(err, 'Transcrição antes de excluir'); }
+  await sendLog(interaction.guild, `🗑️ Ticket #${t.number} excluído por <@${interaction.user.id}>.`, attachment);
+  await interaction.channel.delete(`Naples Tickets | excluído por ${interaction.user.id}`);
+  store.markDeleted(t.id);
+  await interaction.editReply('✅ Canal de ticket excluído.');
+}
+
+async function onRating(interaction, id, starsRaw) {
+  const ticketId = Number(id);
+  const stars = Number(starsRaw);
+  const t = store.getTicketById(ticketId);
+  if (!t || !Number.isInteger(stars) || stars < 1 || stars > 5) return replyError(interaction, 'Avaliação inválida.');
+  if (t.owner_id !== interaction.user.id) return replyError(interaction, 'Somente o solicitante pode avaliar esse ticket.');
+  if (!store.rate(ticketId, interaction.user.id, stars)) return replyError(interaction, 'Este ticket já foi avaliado ou está aberto.');
+  await interaction.update({
+    content: `✅ Avaliação registrada: **${stars}/5 estrelas**. Obrigado!`,
+    embeds: [], components: []
+  });
+  const guild = client.guilds.cache.get(t.guild_id);
+  if (guild) await sendLog(guild, `⭐ Ticket #${t.number} recebeu avaliação **${stars}/5**.`);
+}
+
+async function onTicketCommand(interaction) {
+  const t = guildTicket(interaction);
+  if (!t) return replyError(interaction, 'Execute este comando dentro de um canal de ticket ativo.');
+  const sub = interaction.options.getSubcommand();
+  if (sub === 'info') {
+    if (!canView(interaction, t)) return replyError(interaction, 'Acesso negado.');
+    return interaction.reply({ embeds: [design.ticketCard(t)], flags: EPHEMERAL });
+  }
+  if (sub === 'transcript') return onTranscript(interaction);
+  if (sub === 'fechar') return onClose(interaction);
+  if (sub === 'reabrir') return onReopen(interaction);
+  if (!isStaff(interaction, t)) return replyError(interaction, 'Apenas a equipe pode usar este comando.');
+  if (t.status !== 'open') return replyError(interaction, 'Reabra o ticket para fazer esta alteração.');
+
+  if (sub === 'adicionar' || sub === 'remover') {
+    const user = interaction.options.getUser('usuario', true);
+    if (sub === 'remover' && (user.id === t.owner_id || user.id === client.user.id)) {
+      return replyError(interaction, 'Não é possível remover o autor ou o bot do ticket.');
+    }
+    await interaction.deferReply({ flags: EPHEMERAL });
+    if (sub === 'adicionar') {
+      await interaction.channel.permissionOverwrites.edit(user.id, {
+        ViewChannel: true, SendMessages: true, ReadMessageHistory: true,
+        AttachFiles: true, EmbedLinks: true
+      });
+    } else {
+      // Bloqueia acesso direto; membros da equipe podem continuar acessando via cargo.
+      await interaction.channel.permissionOverwrites.delete(user.id).catch(() => {});
+      if (user.id !== t.owner_id) {
+        await interaction.channel.permissionOverwrites.edit(user.id, { ViewChannel: false });
+      }
+    }
+    return interaction.editReply(`✅ ${user} ${sub === 'adicionar' ? 'adicionado ao' : 'removido do'} ticket.`);
+  }
+  if (sub === 'renomear') {
+    const desired = interaction.options.getString('nome', true);
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const name = ticketName(t.number, desired);
+    await interaction.channel.setName(name);
+    return interaction.editReply(`✅ Canal renomeado para **${name}**.`);
+  }
+}
+
+client.on(Events.InteractionCreate, async interaction => {
+  try {
+    // Avaliações acontecem por DM; por isso são processadas antes da checagem de servidor.
+    if (interaction.isButton() && interaction.customId.startsWith('naples:rate:')) {
+      const [, , id, stars] = interaction.customId.split(':');
+      return await onRating(interaction, id, stars);
+    }
+    if (!interaction.inGuild() || interaction.guildId !== GUILD_ID) return;
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'configurar') return await onConfigure(interaction);
+      if (interaction.commandName === 'painel') return await onPanel(interaction);
+      if (interaction.commandName === 'ticket') return await onTicketCommand(interaction);
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('naples:form:')) {
+      return await onFormSubmit(interaction, interaction.customId.split(':')[2]);
+    }
+    if (!interaction.isButton() || !interaction.customId.startsWith('naples:')) return;
+    const action = interaction.customId.split(':')[1];
+    if (action === 'open') return await onOpenButton(interaction, interaction.customId.split(':')[2]);
+    if (action === 'claim' || action === 'release') return await onClaim(interaction, action);
+    if (action === 'close') return await onClose(interaction);
+    if (action === 'reopen') return await onReopen(interaction);
+    if (action === 'transcript') return await onTranscript(interaction);
+    if (action === 'delete') return await onDelete(interaction);
+    if (action === 'confirm-delete') return await onDelete(interaction, true, interaction.customId.split(':')[2]);
+    if (action === 'cancel-delete') return await interaction.update({ content: 'Exclusão cancelada.', components: [] });
+  } catch (err) {
+    safeError(err, 'Interação');
+    await replyError(interaction, 'Ocorreu um erro inesperado. Confira os Logs do Railway.');
+  }
+});
+
+client.once(Events.ClientReady, ready => {
+  console.log(`[Naples] Online como ${ready.user.tag} | Servidor: ${GUILD_ID}`);
+  console.log('[Naples] SQLite:', process.env.DATABASE_PATH || process.env.RAILWAY_VOLUME_MOUNT_PATH || './data/naples.sqlite');
+});
+
+async function boot() {
+  await registerCommands();
+  await client.login(BOT_TOKEN);
+}
+boot().catch(err => { safeError(err, 'Inicialização'); process.exitCode = 1; });
+
+process.on('SIGINT', () => { client.destroy(); store.db.close(); process.exit(0); });
+process.on('SIGTERM', () => { client.destroy(); store.db.close(); process.exit(0); });
