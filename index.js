@@ -95,6 +95,26 @@ async function replyError(interaction, message) {
   return interaction.reply(data).catch(err => safeError(err, 'Resposta de erro'));
 }
 
+// Em interações de guild não armazenadas no cache, interaction.guild pode ser null.
+// O comando precisa do objeto real do servidor para criar canais e categorias.
+async function resolveGuild(interaction) {
+  if (!interaction.guildId || interaction.guildId !== GUILD_ID) return null;
+  if (interaction.guild) return interaction.guild;
+  try {
+    return await client.guilds.fetch(interaction.guildId);
+  } catch (err) {
+    console.warn('[Naples] Servidor indisponível para o bot:', interaction.guildId,
+      '| Confira se a aplicação foi instalada em Guild Install com escopo bot.');
+    return null;
+  }
+}
+
+const GUILD_MISSING_MESSAGE =
+  'Não consegui acessar a Naples Community. Verifique se o Naples Tickets está instalado ' +
+  '**no servidor** (Guild Install), com os escopos `bot` e `applications.commands`, ' +
+  'e confira se `GUILD_ID` é o ID da Naples Community. ' +
+  'Instalar apenas o aplicativo/comando na conta não adiciona o bot ao servidor.';
+
 async function makeCategoriesAndLogs(guild, config) {
   const updates = {};
   const categories = {
@@ -132,6 +152,8 @@ async function makeCategoriesAndLogs(guild, config) {
 async function onConfigure(interaction) {
   if (!isAdmin(interaction)) return replyError(interaction, 'Apenas administradores podem configurar o bot.');
   await interaction.deferReply({ flags: EPHEMERAL });
+  const guild = await resolveGuild(interaction);
+  if (!guild) return interaction.editReply(`⚠️ ${GUILD_MISSING_MESSAGE}`);
   const existing = store.getSettings(interaction.guildId);
   const updates = {};
   for (const type of Object.keys(TYPES)) {
@@ -148,7 +170,7 @@ async function onConfigure(interaction) {
   const log = interaction.options.getChannel('canal_logs');
   if (log) updates.log_channel = log.id;
   // Usa primeiro as escolhas recém-enviadas; cria apenas o que ainda estiver ausente.
-  const auto = await makeCategoriesAndLogs(interaction.guild, { ...existing, ...updates });
+  const auto = await makeCategoriesAndLogs(guild, { ...existing, ...updates });
   Object.assign(updates, auto, { configured: 1 });
   const saved = store.saveSettings(interaction.guildId, updates);
   const body = Object.entries(TYPES).map(([type, def]) =>
@@ -164,9 +186,12 @@ async function onConfigure(interaction) {
 
 async function onPanel(interaction) {
   if (!isAdmin(interaction)) return replyError(interaction, 'Somente administradores podem publicar o painel.');
+  const guild = await resolveGuild(interaction);
+  if (!guild) return replyError(interaction, GUILD_MISSING_MESSAGE);
   const config = store.getSettings(interaction.guildId);
   if (!config.configured) return replyError(interaction, 'Execute `/configurar` antes de publicar o painel.');
-  const dest = interaction.options.getChannel('canal') || interaction.channel;
+  const dest = interaction.options.getChannel('canal') ||
+    await guild.channels.fetch(interaction.channelId).catch(() => null);
   if (!dest || dest.type !== ChannelType.GuildText) return replyError(interaction, 'Escolha um canal de texto.');
   await interaction.deferReply({ flags: EPHEMERAL });
   const posted = await dest.send({ ...design.panel(), allowedMentions: { parse: [] } });
@@ -175,11 +200,13 @@ async function onPanel(interaction) {
 
 async function onOpenButton(interaction, type) {
   if (!TYPES[type]) return replyError(interaction, 'Departamento inválido.');
+  const guild = await resolveGuild(interaction);
+  if (!guild) return replyError(interaction, GUILD_MISSING_MESSAGE);
   const settings = store.getSettings(interaction.guildId);
   if (!settings.configured) return replyError(interaction, 'Os setores ainda não foram configurados.');
   const existing = store.getOpenTicket(interaction.guildId, interaction.user.id);
   if (existing) {
-    const channel = await interaction.guild.channels.fetch(existing.channel_id).catch(() => null);
+    const channel = await guild.channels.fetch(existing.channel_id).catch(() => null);
     if (channel) return replyError(interaction, `Você já tem um ticket aberto em <#${channel.id}>.`);
     store.markDeleted(existing.id); // limpeza caso alguém tenha excluído o canal manualmente
   }
@@ -196,7 +223,8 @@ async function onFormSubmit(interaction, type) {
   let savedTicket;
   try {
     await interaction.deferReply({ flags: EPHEMERAL });
-    const guild = interaction.guild;
+    const guild = await resolveGuild(interaction);
+    if (!guild) return interaction.editReply(`⚠️ ${GUILD_MISSING_MESSAGE}`);
     const settings = store.getSettings(guild.id);
     if (!settings.configured) return interaction.editReply('O bot ainda não foi configurado.');
     const old = store.getOpenTicket(guild.id, interaction.user.id);
@@ -490,6 +518,12 @@ client.on(Events.InteractionCreate, async interaction => {
 client.once(Events.ClientReady, ready => {
   console.log(`[Naples] Online como ${ready.user.tag} | Servidor: ${GUILD_ID}`);
   console.log('[Naples] SQLite:', process.env.DATABASE_PATH || process.env.RAILWAY_VOLUME_MOUNT_PATH || './data/naples.sqlite');
+  if (ready.guilds.cache.has(GUILD_ID)) {
+    console.log('[Naples] ✅ Bot conectado à Naples Community (Guild Install confirmado).');
+  } else {
+    console.warn('[Naples] ⚠️ O bot não encontrou GUILD_ID entre os servidores conectados. ' +
+      'Confirme a instalação no servidor com escopo bot, e o GUILD_ID do Railway.');
+  }
 });
 
 async function boot() {
