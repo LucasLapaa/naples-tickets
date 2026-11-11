@@ -13,6 +13,7 @@ const { transcriptAttachment } = require('./src/transcript');
 const { TYPES, ticketName, shortText, ticketRoleIds } = require('./src/utility');
 
 const { BOT_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
+console.log('[Naples] BUILD v1.0.3 - correção /configurar carregada');
 if (!BOT_TOKEN || !CLIENT_ID || !GUILD_ID ||
     BOT_TOKEN.startsWith('COLE_') || !/^\d{17,20}$/.test(CLIENT_ID) || !/^\d{17,20}$/.test(GUILD_ID)) {
   console.error('Configure BOT_TOKEN, CLIENT_ID e GUILD_ID no .env ou nas Variables do Railway.');
