@@ -10,7 +10,7 @@ const {
 const store = require('./src/database');
 const design = require('./src/design');
 const { transcriptAttachment } = require('./src/transcript');
-const { TYPES, ticketName, shortText } = require('./src/utility');
+const { TYPES, ticketName, shortText, ticketRoleIds } = require('./src/utility');
 
 const { BOT_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
 if (!BOT_TOKEN || !CLIENT_ID || !GUILD_ID ||
@@ -33,6 +33,9 @@ function createCommands() {
     .addRoleOption(o => o.setName('cargo_suporte').setDescription('Atendentes de suporte'))
     .addRoleOption(o => o.setName('cargo_vendas').setDescription('Atendentes de vendas'))
     .addRoleOption(o => o.setName('cargo_duvidas').setDescription('Atendentes de dúvidas'))
+    .addRoleOption(o => o.setName('cargo_staff').setDescription('Staff: acesso a todos os tickets'))
+    .addRoleOption(o => o.setName('cargo_admin').setDescription('Admin: acesso a todos os tickets'))
+    .addRoleOption(o => o.setName('cargo_owner').setDescription('Owner: acesso a todos os tickets'))
     .addChannelOption(o => o.setName('canal_logs').setDescription('Canal privado para auditoria').addChannelTypes(ChannelType.GuildText))
     .addChannelOption(o => o.setName('categoria_suporte').setDescription('Categoria de tickets de suporte').addChannelTypes(ChannelType.GuildCategory))
     .addChannelOption(o => o.setName('categoria_vendas').setDescription('Categoria de tickets de vendas').addChannelTypes(ChannelType.GuildCategory))
@@ -56,7 +59,12 @@ function createCommands() {
     .addSubcommand(s => s.setName('renomear').setDescription('Renomeia o canal (equipe)')
       .addStringOption(o => o.setName('nome').setDescription('Assunto curto para o nome do canal').setRequired(true).setMinLength(2).setMaxLength(35)));
 
-  return [configure, panel, ticket].map(c => c.toJSON());
+  const privacy = new SlashCommandBuilder()
+    .setName('privacidade')
+    .setDescription('Aplica os cargos atuais nos tickets já criados (remove acessos adicionais)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
+
+  return [configure, panel, ticket, privacy].map(c => c.toJSON());
 }
 
 async function registerCommands() {
@@ -71,10 +79,11 @@ function isAdmin(interaction) {
 function isStaff(interaction, t) {
   if (isAdmin(interaction)) return true;
   const conf = store.getSettings(interaction.guildId);
-  const roleId = conf[TYPES[t.type].roleKey];
-  if (!roleId) return false;
+  const roleIds = ticketRoleIds(conf, t.type);
   const memberRoles = interaction.member?.roles;
-  return !!(memberRoles?.cache?.has(roleId) || (Array.isArray(memberRoles) && memberRoles.includes(roleId)));
+  return roleIds.some(roleId =>
+    memberRoles?.cache?.has(roleId) || (Array.isArray(memberRoles) && memberRoles.includes(roleId))
+  );
 }
 function canView(interaction, t) {
   return t.owner_id === interaction.user.id || isStaff(interaction, t);
@@ -114,6 +123,68 @@ const GUILD_MISSING_MESSAGE =
   '**no servidor** (Guild Install), com os escopos `bot` e `applications.commands`, ' +
   'e confira se `GUILD_ID` é o ID da Naples Community. ' +
   'Instalar apenas o aplicativo/comando na conta não adiciona o bot ao servidor.';
+
+async function buildTicketOverwrites(guild, ownerId, type, settings, status = 'open') {
+  const baseAllow = [
+    PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks,
+    PermissionFlagsBits.AttachFiles
+  ];
+  const entries = [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: client.user.id, allow: [...baseAllow, PermissionFlagsBits.ManageChannels] },
+    {
+      id: ownerId,
+      allow: status === 'closed' ? baseAllow.filter(p => p !== PermissionFlagsBits.SendMessages) : baseAllow,
+      ...(status === 'closed' ? { deny: [PermissionFlagsBits.SendMessages] } : {})
+    }
+  ];
+  for (const roleId of ticketRoleIds(settings, type)) {
+    const role = guild.roles.cache.get(roleId) || await guild.roles.fetch(roleId).catch(() => null);
+    if (!role) {
+      console.warn('[Naples] Cargo configurado não encontrado:', roleId);
+      continue;
+    }
+    entries.push({ id: roleId, allow: baseAllow });
+  }
+  return entries;
+}
+
+async function syncExistingTicketPermissions(guild, settings) {
+  let updated = 0, skipped = 0, errors = 0;
+  for (const ticket of store.listExistingTickets(guild.id)) {
+    try {
+      const channel = await guild.channels.fetch(ticket.channel_id).catch(() => null);
+      if (!channel || channel.type !== ChannelType.GuildText) { skipped++; continue; }
+      const overwrites = await buildTicketOverwrites(guild, ticket.owner_id, ticket.type, settings, ticket.status);
+      // Modo privacidade estrito: remove acessos de cargos e pessoas não listados.
+      await channel.permissionOverwrites.set(overwrites, 'Naples Tickets | sincronização de privacidade');
+      updated++;
+    } catch (error) {
+      errors++;
+      safeError(error, `Sincronizar permissões do ticket ${ticket.number}`);
+    }
+  }
+  return { updated, skipped, errors };
+}
+
+async function onPrivacy(interaction) {
+  if (!isAdmin(interaction)) return replyError(interaction, 'Somente administradores podem sincronizar os tickets.');
+  await interaction.deferReply({ flags: EPHEMERAL });
+  const guild = await resolveGuild(interaction);
+  if (!guild) return interaction.editReply(`⚠️ ${GUILD_MISSING_MESSAGE}`);
+  const settings = store.getSettings(guild.id);
+  if (!settings.configured) return interaction.editReply('Execute `/configurar` primeiro.');
+  if (!['role_staff', 'role_admin', 'role_owner'].every(k => settings[k])) {
+    return interaction.editReply('⚠️ Configure primeiro os três cargos `cargo_staff`, `cargo_admin` e `cargo_owner` em `/configurar`.');
+  }
+  const result = await syncExistingTicketPermissions(guild, settings);
+  return interaction.editReply(`🔒 **Permissões sincronizadas.**\n✅ ${result.updated} tickets atualizados\n` +
+    `⏭️ ${result.skipped} canais não encontrados\n❌ ${result.errors} falhas (veja os logs).\n\n` +
+    'Os canais agora permitem o solicitante, o bot e os cargos Staff, Admin e Owner. ' +
+    'Participantes extras adicionados anteriormente perderam o acesso. ' +
+    'Membros com permissão **Administrador** no servidor continuam tendo acesso por regra do Discord.');
+}
 
 async function makeCategoriesAndLogs(guild, config) {
   const updates = {};
@@ -167,6 +238,18 @@ async function onConfigure(interaction) {
     }
     if (category) updates[TYPES[type].categoryKey] = category.id;
   }
+  for (const [field, key] of [
+    ['cargo_staff', 'role_staff'],
+    ['cargo_admin', 'role_admin'],
+    ['cargo_owner', 'role_owner']
+  ]) {
+    const role = interaction.options.getRole(field);
+    if (!role) continue;
+    if (role.id === interaction.guildId || role.managed) {
+      return interaction.editReply(`O cargo ${field} precisa ser um cargo comum do servidor, não @everyone nem cargo de integração.`);
+    }
+    updates[key] = role.id;
+  }
   const log = interaction.options.getChannel('canal_logs');
   if (log) updates.log_channel = log.id;
   // Usa primeiro as escolhas recém-enviadas; cria apenas o que ainda estiver ausente.
@@ -178,8 +261,12 @@ async function onConfigure(interaction) {
   ).join('\n');
   return interaction.editReply({
     content: `✅ **Naples Tickets configurado!**\n\n${body}\n📑 Logs: <#${saved.log_channel}>\n\n` +
-      '**Próximo passo:** defina os cargos de equipe, se faltarem, e use `/painel` para publicar o menu. ' +
-      'Mudanças de cargos se aplicam automaticamente aos novos tickets; ajuste permissões dos antigos manualmente se necessário.',
+      `**Acesso geral a todos os tickets:**\n` +
+      `🛡️ Staff: ${saved.role_staff ? `<@&${saved.role_staff}>` : '**não definido**'}\n` +
+      `⚙️ Admin: ${saved.role_admin ? `<@&${saved.role_admin}>` : '**não definido**'}\n` +
+      `👑 Owner: ${saved.role_owner ? `<@&${saved.role_owner}>` : '**não definido**'}\n\n` +
+      '**Próximo passo:** use `/painel` e, para tickets antigos, `/privacidade`. ' +
+      'Depois de definir cargos gerais, os cargos específicos de departamento deixam de conceder acesso automaticamente.',
     allowedMentions: { parse: [] }
   });
 }
@@ -237,25 +324,10 @@ async function onFormSubmit(interaction, type) {
     const number = store.nextNumber(guild.id);
     const topic = interaction.fields.getTextInputValue('topic');
     const details = interaction.fields.getTextInputValue('details');
-    const roleId = settings[definition.roleKey];
     const categoryId = settings[definition.categoryKey];
-    const overwrites = [
-      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-      { id: client.user.id, allow: [
-        PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels,
-        PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles
-      ] },
-      { id: interaction.user.id, allow: [
-        PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles
-      ] }
-    ];
-    if (roleId && guild.roles.cache.has(roleId)) {
-      overwrites.push({ id: roleId, allow: [
-        PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles
-      ] });
-    }
+    const overwrites = await buildTicketOverwrites(guild, interaction.user.id, type, settings);
+    const announceRole = settings.role_staff || (ticketRoleIds(settings, type)[0] || null);
+    const canMentionRole = announceRole && overwrites.some(entry => entry.id === announceRole);
     createdChannel = await guild.channels.create({
       name: ticketName(number, type),
       type: ChannelType.GuildText,
@@ -267,13 +339,13 @@ async function onFormSubmit(interaction, type) {
       guild_id: guild.id, number, channel_id: createdChannel.id,
       owner_id: interaction.user.id, type, topic, details
     });
-    const hasRole = roleId && guild.roles.cache.has(roleId);
-    const mention = `<@${interaction.user.id}>${hasRole ? ` • <@&${roleId}>` : ''}`;
+    const hasRole = !!canMentionRole;
+    const mention = `<@${interaction.user.id}>${hasRole ? ` • <@&${announceRole}>` : ''}`;
     const message = await createdChannel.send({
       content: mention,
       embeds: [design.ticketCard(savedTicket)],
       components: design.ticketButtons('open'),
-      allowedMentions: { users: [interaction.user.id], roles: hasRole ? [roleId] : [] }
+      allowedMentions: { users: [interaction.user.id], roles: hasRole ? [announceRole] : [] }
     });
     store.setControls(savedTicket.id, message.id);
     lastOpened.set(key, Date.now());
@@ -495,6 +567,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.commandName === 'configurar') return await onConfigure(interaction);
       if (interaction.commandName === 'painel') return await onPanel(interaction);
       if (interaction.commandName === 'ticket') return await onTicketCommand(interaction);
+      if (interaction.commandName === 'privacidade') return await onPrivacy(interaction);
     }
     if (interaction.isModalSubmit() && interaction.customId.startsWith('naples:form:')) {
       return await onFormSubmit(interaction, interaction.customId.split(':')[2]);
