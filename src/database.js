@@ -120,8 +120,52 @@ function rate(id, userId, stars) {
   return db.prepare(`UPDATE tickets SET rating = ? WHERE id = ? AND owner_id = ? AND status IN ('closed','deleted') AND rating IS NULL`)
     .run(stars, id, userId).changes > 0;
 }
+
+// PIX: guarda apenas IDs e valores, sem credenciais, e-mail ou dados bancários.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pix_payments (
+    payment_id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    buyer_id TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    external_reference TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    message_id TEXT,
+    created_at TEXT NOT NULL,
+    approved_at TEXT,
+    notified_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_pix_guild ON pix_payments(guild_id, channel_id);
+`);
+const insertPix = db.prepare(`
+  INSERT INTO pix_payments
+  (payment_id, guild_id, channel_id, buyer_id, amount_cents, external_reference, created_at)
+  VALUES (@payment_id, @guild_id, @channel_id, @buyer_id, @amount_cents, @external_reference, @created_at)
+`);
+function addPix(record) { insertPix.run({ ...record, created_at: new Date().toISOString() }); }
+function getPix(id) { return db.prepare('SELECT * FROM pix_payments WHERE payment_id=?').get(String(id)); }
+function setPixMessage(id, messageId) {
+  db.prepare('UPDATE pix_payments SET message_id=? WHERE payment_id=?').run(messageId, String(id));
+}
+function markPixApproved(id) {
+  db.prepare(`UPDATE pix_payments SET status='approved', approved_at=COALESCE(approved_at,?) WHERE payment_id=?`)
+    .run(new Date().toISOString(), String(id));
+}
+function updatePixStatus(id, status) {
+  db.prepare(`UPDATE pix_payments SET status=? WHERE payment_id=? AND status <> 'approved'`).run(status, String(id));
+}
+function markPixNotified(id) {
+  db.prepare(`UPDATE pix_payments SET notified_at=COALESCE(notified_at,?) WHERE payment_id=?`)
+    .run(new Date().toISOString(), String(id));
+}
+function pendingPixNotifications() {
+  return db.prepare(`SELECT payment_id FROM pix_payments WHERE status='approved' AND notified_at IS NULL`).all();
+}
+
 module.exports = {
   db, getSettings, saveSettings, nextNumber, addTicket, getTicketById,
   getTicketByChannel, getOpenTicket, setControls, claim, release, close,
-  reopen, markDeleted, rate, listExistingTickets
+  reopen, markDeleted, rate, listExistingTickets,
+  addPix, getPix, setPixMessage, markPixApproved, updatePixStatus, markPixNotified, pendingPixNotifications
 };
