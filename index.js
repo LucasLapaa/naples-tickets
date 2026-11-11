@@ -13,7 +13,7 @@ const { transcriptAttachment } = require('./src/transcript');
 const { TYPES, ticketName, shortText, ticketRoleIds } = require('./src/utility');
 
 const { BOT_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
-console.log('[Naples] BUILD v1.0.4 - comando /imagem habilitado');
+console.log('[Naples] BUILD v1.0.5 - /imagem com anexo, link e URL de imagem');
 if (!BOT_TOKEN || !CLIENT_ID || !GUILD_ID ||
     BOT_TOKEN.startsWith('COLE_') || !/^\d{17,20}$/.test(CLIENT_ID) || !/^\d{17,20}$/.test(GUILD_ID)) {
   console.error('Configure BOT_TOKEN, CLIENT_ID e GUILD_ID no .env ou nas Variables do Railway.');
@@ -47,15 +47,19 @@ function createCommands() {
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addChannelOption(o => o.setName('canal').setDescription('Canal onde publicar o painel').addChannelTypes(ChannelType.GuildText));
 
-  // Publica qualquer imagem enviada pelo administrador em um canal de texto.
+  // /imagem aceita arquivo enviado pelo Discord OU uma URL pública da imagem.
+  // O link é opcional e aparece como endereço clicável junto à mensagem.
   const imagePost = new SlashCommandBuilder()
-    .setName('imagem').setDescription('Publica uma imagem em um canal escolhido (administradores)')
+    .setName('imagem').setDescription('Publica imagem e/ou link no canal escolhido (administradores)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addChannelOption(o => o.setName('canal').setDescription('Canal que receberá a imagem')
+    .addChannelOption(o => o.setName('canal').setDescription('Canal que receberá a publicação')
       .addChannelTypes(ChannelType.GuildText).setRequired(true))
-    .addAttachmentOption(o => o.setName('arquivo').setDescription('Imagem PNG, JPG, WEBP ou GIF')
-      .setRequired(true))
-    .addStringOption(o => o.setName('legenda').setDescription('Texto opcional acima da imagem')
+    .addAttachmentOption(o => o.setName('arquivo').setDescription('Anexe PNG, JPG, WEBP ou GIF (opcional)'))
+    .addStringOption(o => o.setName('imagem_url').setDescription('URL pública e direta da imagem, alternativa ao arquivo')
+      .setMaxLength(1500))
+    .addStringOption(o => o.setName('link').setDescription('Link clicável para aparecer na publicação (opcional)')
+      .setMaxLength(1500))
+    .addStringOption(o => o.setName('legenda').setDescription('Texto que acompanha a imagem ou link (opcional)')
       .setMaxLength(1000));
 
   const ticket = new SlashCommandBuilder()
@@ -297,44 +301,85 @@ async function onPanel(interaction) {
   return interaction.editReply(`✅ Painel publicado em <#${dest.id}>: ${posted.url}`);
 }
 
+// Valida links sem buscar conteúdo remoto. Assim o bot não acessa URLs arbitrárias.
+function publicHttpUrl(value, label) {
+  const raw = (value || '').trim();
+  if (!raw) return null;
+  if (/\s/.test(raw)) throw new Error(`${label}: não inclua espaços ou quebras de linha no link.`);
+  let parsed;
+  try { parsed = new URL(raw); }
+  catch { throw new Error(`${label}: informe um endereço completo, por exemplo https://site.com/imagem.png.`); }
+  if (!['https:', 'http:'].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password)
+    throw new Error(`${label}: use um link HTTP/HTTPS público e sem usuário/senha.`);
+  return parsed.href;
+}
+
 async function onImagePost(interaction) {
-  if (!isAdmin(interaction)) return replyError(interaction, 'Somente administradores podem publicar imagens.');
+  if (!isAdmin(interaction)) return replyError(interaction, 'Somente administradores podem publicar imagens e links.');
   const guild = await resolveGuild(interaction);
   if (!guild) return replyError(interaction, GUILD_MISSING_MESSAGE);
 
   const selected = interaction.options.getChannel('canal', true);
-  const image = interaction.options.getAttachment('arquivo', true);
-  const caption = interaction.options.getString('legenda') || '';
+  const image = interaction.options.getAttachment('arquivo');
+  const caption = (interaction.options.getString('legenda') || '').trim();
+  let imageUrl, link;
+  try {
+    imageUrl = publicHttpUrl(interaction.options.getString('imagem_url'), 'Imagem URL');
+    link = publicHttpUrl(interaction.options.getString('link'), 'Link');
+  } catch (err) {
+    return replyError(interaction, err.message);
+  }
+
+  if (!image && !imageUrl && !link)
+    return replyError(interaction, 'Preencha `arquivo`, `imagem_url` ou `link`. É necessário informar pelo menos um deles.');
+  if (image && imageUrl)
+    return replyError(interaction, 'Escolha apenas uma fonte da imagem: `arquivo` OU `imagem_url`. O campo `link` pode acompanhar qualquer uma.');
+
+  // Texto simples com URL clicável. Não marca usuários ou @everyone.
+  const content = [caption, link ? `🔗 ${link}` : ''].filter(Boolean).join('\n');
+  if (content.length > 2000)
+    return replyError(interaction, 'A legenda e o link ultrapassam 2.000 caracteres. Reduza um dos campos.');
+
   const destination = await guild.channels.fetch(selected.id).catch(() => null);
   if (!destination || destination.type !== ChannelType.GuildText)
-    return replyError(interaction, 'Escolha um canal de texto do servidor Naples Community.');
+    return replyError(interaction, 'Escolha um canal de texto da Naples Community.');
 
-  // Aceita imagens enviadas diretamente no Discord, evitando URL fornecida por terceiros.
-  const extension = image.name?.split('.').pop()?.toLowerCase() || '';
-  const allowed = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
-  const isImage = (image.contentType && image.contentType.startsWith('image/')) ||
-    (!image.contentType && allowed.includes(extension));
-  if (!isImage || !allowed.includes(extension))
-    return replyError(interaction, 'Envie um arquivo PNG, JPG, JPEG, WEBP ou GIF.');
+  let extension = null;
+  if (image) {
+    extension = image.name?.split('.').pop()?.toLowerCase() || '';
+    const allowed = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
+    const validContent = image.contentType
+      ? image.contentType.startsWith('image/') : allowed.includes(extension);
+    if (!validContent || !allowed.includes(extension))
+      return replyError(interaction, 'O `arquivo` deve ser PNG, JPG, JPEG, WEBP ou GIF.');
+  }
 
   const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
   const permissions = me && destination.permissionsFor(me);
-  if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
-    PermissionFlagsBits.AttachFiles])) {
-    return replyError(interaction, 'O bot precisa de Ver Canal, Enviar Mensagens e Anexar Arquivos nesse canal.');
-  }
+  const needed = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages];
+  if (image) needed.push(PermissionFlagsBits.AttachFiles);
+  if (imageUrl) needed.push(PermissionFlagsBits.EmbedLinks);
+  if (!permissions?.has(needed))
+    return replyError(interaction, 'Faltam permissões para publicar nesse canal. Verifique: Ver Canal, Enviar Mensagens e, conforme o caso, Anexar Arquivos/Inserir Links.');
 
   await interaction.deferReply({ flags: EPHEMERAL });
   try {
-    const sent = await destination.send({
-      content: caption || undefined,
-      files: [{ attachment: image.url, name: `naples-imagem.${extension}` }],
-      allowedMentions: { parse: [] }
-    });
-    return interaction.editReply(`✅ Imagem publicada em <#${destination.id}>! ${sent.url}`);
+    const payload = { allowedMentions: { parse: [] } };
+    if (content) payload.content = content;
+    if (image) {
+      // Envia a imagem escolhida como arquivo na mensagem do bot.
+      payload.files = [{ attachment: image.url, name: `naples-imagem.${extension}` }];
+    } else if (imageUrl) {
+      // A imagem URL aparece no corpo da mensagem como imagem incorporada.
+      // O Discord resolve a URL; o processo Node.js não faz downloads externos.
+      payload.embeds = [new EmbedBuilder().setColor(0x26D36C).setImage(imageUrl)];
+    }
+
+    const sent = await destination.send(payload);
+    return interaction.editReply(`✅ Publicação enviada em <#${destination.id}>! ${sent.url}`);
   } catch (err) {
-    safeError(err, 'Publicar imagem');
-    return interaction.editReply('❌ Não consegui publicar a imagem. Confira as permissões do canal e o tamanho do arquivo.');
+    safeError(err, 'Publicar imagem/link');
+    return interaction.editReply('❌ Não consegui publicar. Confira as permissões e o link/arquivo. Em `imagem_url`, use uma URL pública direta de imagem.');
   }
 }
 
